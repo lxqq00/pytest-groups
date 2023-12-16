@@ -1,0 +1,6 @@
+/tests
+/venv
+/conftest.py
+/pytest.ini
+/.idea
+/__pycache__
