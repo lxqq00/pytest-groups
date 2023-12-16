@@ -19,6 +19,8 @@ THREAD_COUNT = "thread"
 # 不接受并发
 NOTCONCURRENT = "notconcurrent"
 
+NOTCONCURRENT = "notconcurrent"
+
 
 def pytest_addoption(parser):
     thread_help = "线程数量，每个线程都会用于启动一个分组，默认值：1"
@@ -60,9 +62,10 @@ def parse_config(config, name):
 
 def pytest_configure(config):
     # 声明@pytest.mark.group
-    config.addinivalue_line("markers", f"{CASE_GROUP_TAG}: 装饰case(类、模块、函数)，声明case所归属的组")
+    config.addinivalue_line("markers", f"{CASE_GROUP_TAG}: 装饰case(类、模块、函数)，声明case默认默认的分组规则")
     # 声明@pytest.mark.notconcurrent
     config.addinivalue_line("markers", f"{NOTCONCURRENT}: 声明case不接受并发")
+    # config.addinivalue_line("markers", f"{NOTCONCURRENT}: 声明case不接受并发")
 
     thread_count = parse_config(config, THREAD_COUNT)
     # 如果有配置插件相关参数（thread等），才启用插件,默认启用
@@ -280,58 +283,6 @@ class GroupRunner(object):
                         time.sleep(0.1)
         return True
 
-        # with ThreadPoolExecutor(max_workers=self.thread_count) as executor:
-        #     items = list(session.items)
-        #     for i in range(len(items)):
-        #
-        #         while True:
-        #             next_task = None
-        #             for item in items:
-        #                 next_task = item
-        #
-        #                 # 检查计划运行的任务item在各个任务组中的索引，如果索引为-1即不存在于任务组中
-        #                 plan_task_exists = self.item_map_exist.setdefault(item, [])
-        #                 if len(plan_task_exists) == 0:
-        #                     for group_task in self.group_tasks:
-        #                         try:
-        #                             _ = group_task.index(item)
-        #                             plan_task_exists.append(_)
-        #                         except ValueError as e:
-        #                             plan_task_exists.append(-1)
-        #
-        #                 # 遍历当前正在运行的任务performing_task，检查与当前计划运行的任务item是否冲突
-        #                 # 如果有冲突，说明当前任务不能执行
-        #                 for performing_task in self.tasks:
-        #                     performing_task_exists = self.item_map_exist.setdefault(performing_task, [])
-        #                     for i in range(len(performing_task_exists)):
-        #                         # 检查与当前计划运行的任务item是否冲突
-        #                         if plan_task_exists[i] == -1 or performing_task_exists[i] == -1 or plan_task_exists[
-        #                             i] <= performing_task_exists[i]:
-        #                             continue
-        #                         else:
-        #                             next_task = None
-        #                             break
-        #                     if not next_task:
-        #                         break
-        #                 # 找到一个不冲突的任务
-        #                 if next_task:
-        #                     break
-        #
-        #             # 执行任务，或短暂等待后重新搜索不冲突的任务
-        #             if next_task:
-        #                 with self.lock:
-        #                     items.remove(next_task)
-        #                     self.tasks.append(next_task)
-        #
-        #                 # if self.thread_count > 1:
-        #                 executor.submit(self.run_one_test_item, self, session, i, next_task, self)
-        #                 # elif self.thread_count <= 1:
-        #                 #     self.run_one_test_item(session, i, next_task, self)
-        #             else:
-        #                 # 如果找不到可以运行的任务，就先稍等一下
-        #                 time.sleep(0.1)
-        # return True
-
     def check_task_permission(self, next_task):
         """
         检查任务是否可执行，确保任务不会因为业务逻辑冲突与其他任务发生互斥
@@ -351,10 +302,7 @@ class GroupRunner(object):
         notconcurrent = self.is_notconcurrent.get(task)
         if not notconcurrent:
             notconcurrent = task.get_closest_marker(NOTCONCURRENT)
-            if notconcurrent:
-                notconcurrent = True
-            else:
-                notconcurrent = False
+            notconcurrent = notconcurrent is not None
         self.is_notconcurrent[task] = notconcurrent
         return notconcurrent
 
