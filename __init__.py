@@ -18,55 +18,33 @@ CASE_GROUP_TAG = "group"
 THREAD_COUNT = "thread"
 # 不接受并发
 NOTCONCURRENT = "notconcurrent"
-
-NOTCONCURRENT = "notconcurrent"
+# 资源占用互斥marker
+RESOURCE = "resource"
 
 
 def pytest_addoption(parser):
     thread_help = "线程数量，每个线程都会用于启动一个分组，默认值：1"
-    group_unit_help = "自动分组单元单位，同一个单元单位内的case自动被规划到一个分组内，可选值：module(默认值)/class/function"
 
     # pytest -h 中添加命令帮助信息
     group = parser.getgroup('pytest-groups')
     group.addoption(f"--{THREAD_COUNT}", action="store", default=1, help=thread_help)
-    group.addoption(f"--{CASE_GROUP_UNIT_TAG}", action="store", default="module", help=group_unit_help)
 
     # 添加参数到pytest.ini的配置对象中，效果相当于pytest.ini进行了相关配置
     parser.addini(THREAD_COUNT, type="args", default=1, help=thread_help)
+
+    group_unit_help = "自动分组单元单位，同一个单元单位内的case自动被规划到一个分组内，可选值：module(默认值)/class/function"
+
+    # pytest -h 中添加命令帮助信息
+    group = parser.getgroup('pytest-groups')
+    group.addoption(f"--{CASE_GROUP_UNIT_TAG}", action="store", default="module", help=group_unit_help)
+
+    # 添加参数到pytest.ini的配置对象中，效果相当于pytest.ini进行了相关配置
     # parser.addini('group-unit', type="args", default="class", help=group_unit_help)
     parser.addini(CASE_GROUP_UNIT_TAG, type="args", default="module", help=group_unit_help)
     # parser.addini('group-unit', type="args", default="function", help=group_unit_help)
 
 
-def parse_config(config, name):
-    """
-    依次尝试从命令参数、pytest.ini配置文件中取得应该生效的参数。
-
-    :param config: 配置对象
-    :param name: 配置name
-    :return: 生效的配置参数
-    """
-    t1 = getattr(config.option, name, None)
-    if t1:
-        return t1
-
-    t2 = config.getoption(f'--{name}')
-    if t2:
-        return t2
-
-    t3 = config.getini(name)
-    if t3:
-        return t3[0]
-    return None
-
-
 def pytest_configure(config):
-    # 声明@pytest.mark.group
-    config.addinivalue_line("markers", f"{CASE_GROUP_TAG}: 装饰case(类、模块、函数)，声明case默认默认的分组规则")
-    # 声明@pytest.mark.notconcurrent
-    config.addinivalue_line("markers", f"{NOTCONCURRENT}: 声明case不接受并发")
-    # config.addinivalue_line("markers", f"{NOTCONCURRENT}: 声明case不接受并发")
-
     thread_count = parse_config(config, THREAD_COUNT)
     # 如果有配置插件相关参数（thread等），才启用插件,默认启用
     if not config.option.collectonly and thread_count:
@@ -140,6 +118,28 @@ class ThreadLocalEnviron(os._Environ):
         return type(self)(self)
 
 
+def parse_config(config, name):
+    """
+    依次尝试从命令参数、pytest.ini配置文件中取得应该生效的参数。
+
+    :param config: 配置对象
+    :param name: 配置name
+    :return: 生效的配置参数
+    """
+    t1 = getattr(config.option, name, None)
+    if t1:
+        return t1
+
+    t2 = config.getoption(f'--{name}')
+    if t2:
+        return t2
+
+    t3 = config.getini(name)
+    if t3:
+        return t3[0]
+    return None
+
+
 class GroupRunner(object):
     def __init__(self, config):
         # 获取应该启动的线程数
@@ -153,6 +153,14 @@ class GroupRunner(object):
         self.task_index = 0
         self.is_notconcurrent = {}
 
+    def pytest_configure(self, config):
+        # 声明@pytest.mark.group
+        config.addinivalue_line("markers", f"{CASE_GROUP_TAG}: 装饰case(类、模块、函数)，声明case默认默认的分组规则")
+        # 声明@pytest.mark.notconcurrent
+        config.addinivalue_line("markers", f"{NOTCONCURRENT}: 声明case不接受并发")
+        # 声明@pytest.mark.resource
+        config.addinivalue_line("markers", f"{RESOURCE}: 声明case使用的资源")
+
     @pytest.mark.tryfirst
     def pytest_sessionstart(self, session):
         import _pytest
@@ -161,47 +169,66 @@ class GroupRunner(object):
 
         # 确保fixture(特别是终结器)是线程安全的
         # 但是添加这个这个配置之后，会有fixture重入问题
-        # _pytest.fixtures.FixtureDef = ThreadLocalFixtureDef
+        _pytest.fixtures.FixtureDef = ThreadLocalFixtureDef
 
         # 创建线程安全的os.environ
         os.environ = ThreadLocalEnviron(os.environ)
 
-        # FixtureRequest是一个内部类，它用于表示一个测试请求的上下文。这个类提供了对测试用例执行过程中的各种信息和状态的访问。
-        # 当你在测试用例或fixture中使用request对象时，你实际上是在与FixtureRequest实例进行交互。
-        # 可以认为存在一个名为request的fixture,
-        # request对象可以：
-        # 1. 访问测试上下文：它允许你访问当前测试的配置、参数、所属模块、类、实例等信息。
-        # 2. 参数化支持：如果fixture被参数化，FixtureRequest对象将包含一个param属性，允许你访问当前测试用例的参数值。
-        # 3. 添加finalizer：你可以使用addfinalizer方法为测试添加清理函数，这些函数会在测试用例执行完成后调用。
-        # 4. 动态获取fixture：通过getfixturevalue方法，你可以动态地获取其他fixture的值。
-        from _pytest.fixtures import FixtureRequest
-
-        # _fillfixtures是一个内部方法，在执行测试函数或fixture函数过程中，这个方法会查找与参数名称相匹配的fixture，
-        # 并将fixture的返回值注入到测试函数或其他fixture函数中。
-        # 其内部逻辑，如果fixture没有被调用，调用_get_active_fixturedef调用并缓存执行结果
-        # 但是在多线程运行case的场景下，会有线程同步问题，如果不做处理会导致fixture重入
-        # 所以要对_get_active_fixturedef限制并发调用
-        def sync_call(func):
-            """
-            装饰器，以相同的入参的调用函数时会被阻塞，使同时只能有一个并发
-            """
-            function_thread_lock_dict = defaultdict(threading.Lock)
-
-            @wraps(func)
-            def run(obj, argname: str):
-                with function_thread_lock_dict[argname]:
-                    return func(obj, argname)
-
-            return run
-
-        FixtureRequest._get_active_fixturedef = sync_call(FixtureRequest._get_active_fixturedef)
+        # # FixtureRequest是一个内部类，它用于表示一个测试请求的上下文。这个类提供了对测试用例执行过程中的各种信息和状态的访问。
+        # # 当你在测试用例或fixture中使用request对象时，你实际上是在与FixtureRequest实例进行交互。
+        # # 可以认为存在一个名为request的fixture,
+        # # request对象可以：
+        # # 1. 访问测试上下文：它允许你访问当前测试的配置、参数、所属模块、类、实例等信息。
+        # # 2. 参数化支持：如果fixture被参数化，FixtureRequest对象将包含一个param属性，允许你访问当前测试用例的参数值。
+        # # 3. 添加finalizer：你可以使用addfinalizer方法为测试添加清理函数，这些函数会在测试用例执行完成后调用。
+        # # 4. 动态获取fixture：通过getfixturevalue方法，你可以动态地获取其他fixture的值。
+        # from _pytest.fixtures import FixtureRequest
+        #
+        # # _fillfixtures是一个内部方法，在执行测试函数或fixture函数过程中，这个方法会查找与参数名称相匹配的fixture，
+        # # 并将fixture的返回值注入到测试函数或其他fixture函数中。
+        # # 其内部逻辑，如果fixture没有被调用，调用_get_active_fixturedef调用并缓存执行结果
+        # # 但是在多线程运行case的场景下，会有线程同步问题，如果不做处理会导致fixture重入
+        # # 所以要对_get_active_fixturedef限制并发调用
+        # def sync_call(func):
+        #     """
+        #     装饰器，以相同的入参的调用函数时会被阻塞，使同时只能有一个并发
+        #     """
+        #     function_thread_lock_dict = defaultdict(threading.Lock)
+        #
+        #     @wraps(func)
+        #     def run(obj, argname: str):
+        #         with function_thread_lock_dict[argname]:
+        #             return func(obj, argname)
+        #
+        #     return run
+        #
+        # FixtureRequest._get_active_fixturedef = sync_call(FixtureRequest._get_active_fixturedef)
         # FixtureRequest._fillfixtures = _fillfixtures
+
+    def pytest_collection_modifyitems(self, session, config, items):
+        # case分组的单元的mark标签字符
+        # CASE_UNIT_TAG
+
+        for item in items:
+            # 读取@pytest.mark.unit_group对case定义的分组单元
+            units = self.get_marker_or_default(config, item, CASE_GROUP_UNIT_TAG)
+
+            for u in units:
+                # 标记item到应该归属的分组，
+                groups = self._gener_item_group_key(item, u)
+
+                for g in groups:
+                    self.item_dict.setdefault(g, []).append(item)
+
+        pass
+
+    index = 0
 
     @staticmethod
     def run_one_test_item(self, session, item, nextitem=None):
         try:
-            item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
-            # item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+            reports = item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+            # item.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
             if session.shouldfail:
                 raise session.Failed(session.shouldfail)
             if session.shouldstop:
@@ -384,10 +411,10 @@ class GroupRunner(object):
                 self.items.remove(next_task)
                 self.tasks.append(next_task)
 
-        print("--------------------------------------")
-        print(next_task)
-        print(self.tasks)
-        print("--------------------------------------")
+        # print("--------------------------------------")
+        # print(next_task)
+        # print(self.tasks)
+        # print("--------------------------------------")
 
         self.task_order.append(next_task)
         # 当前有2个以上的任务未被执行，就先启动倒数第2个任务，倒数第一个任务可能需要稍稍等一会才能启动
@@ -463,20 +490,3 @@ class GroupRunner(object):
         if not marker:
             return (parse_config(config, tag),)
         return marker.args
-
-    def pytest_collection_modifyitems(self, session, config, items):
-        # case分组的单元的mark标签字符
-        # CASE_UNIT_TAG
-
-        for item in items:
-            # 读取@pytest.mark.unit_group对case定义的分组单元
-            units = self.get_marker_or_default(config, item, CASE_GROUP_UNIT_TAG)
-
-            for u in units:
-                # 标记item到应该归属的分组，
-                groups = self._gener_item_group_key(item, u)
-
-                for g in groups:
-                    self.item_dict.setdefault(g, []).append(item)
-
-        pass
