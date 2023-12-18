@@ -168,6 +168,11 @@ pytest --group-unit=class
 所以最终只会有n-1个线程运行。
 解决方法（待实现）：根据任务组、item全局顺序，提前计算任务组内的下一个任务，例如a1/a2/a3,b1/b2/b3。
 
-由于任务的调度顺序与默认顺序不一致，导致fixture的调用顺序也会与pytest默认的执行顺序不一致。
+本插件不完全兼容pytest-ordering插件，pytest-ordering插件通过@pytest.mark.run(order=1)标示case的优先级，之后根据优先级对case的先后顺序进行排序，但是排序后的顺序还不是最后执行的顺序。
+本插件就在最后执行case的步骤中工作，会根据本插件的顺序对具体的case再进行排序，所以case的最终执行顺序较大可能与pytest-ordering的顺序不一致。但是通过pytest-ordering排序靠前执行的，经过本插件再调度后仍然有比较可能靠前执行。
+
+由于任务的调度顺序与默认顺序不一致，导致fixture的调用顺序也会与pytest默认的执行顺序不一致，pytest-ordering插件有同样的问题。
 
 由于是并发执行case,会存在fixture或setup/treamdown方法被在多个case中同时被执行，因此相关方法需要时线程安全的。
+
+先将case分为多个分组，为每个分组的启动对应的一个线程，之后运行case就把case放在对应的线程内执行，
