@@ -3,12 +3,12 @@ import os
 import threading
 import time
 from collections import defaultdict
+
 from concurrent.futures.thread import ThreadPoolExecutor
-from functools import wraps, reduce
-from typing import Tuple, Union, Callable, Optional
+from typing import Tuple, Optional
 
 import pytest
-from _pytest.fixtures import FixtureDef, FixtureLookupError, PseudoFixtureDef, SubRequest, scopes, FixtureRequest
+from _pytest.fixtures import FixtureDef, SubRequest, FixtureRequest
 from _pytest.nodes import Item
 from _pytest.python import Function
 from _pytest.runner import SetupState, _update_current_test_var
@@ -67,17 +67,6 @@ class ThreadLocalSetupState(SetupState, threading.local):
 class ThreadLocalFixtureDef(FixtureDef, threading.local):
     def __init__(self, *args, **kwargs):
         super(ThreadLocalFixtureDef, self).__init__(*args, **kwargs)
-
-
-#
-# setup_fixtrue_map = {}
-#
-# old_schedule_finalizers = _schedule_finalizers
-#
-#
-# def new_schedule_finalizers(self: FixtureRequest, finalizer: Callable[[], object], scope) -> None:
-#     map = setup_fixtrue_map.setdefault(self,{})
-#     map[]
 
 
 class ThreadLocalEnviron(os._Environ):
@@ -159,44 +148,44 @@ def parse_config(config, name):
     return None
 
 
-def has_stack_level_change(item, nextitem):
-    """
-    检查两个入参的堆栈层级是否有变化
-    例如：
-    has_stack_level_change("/a/b","/a/c") -> 1,2，0,"/a",False
-    has_stack_level_change("/a/b","/a/c/d") -> 1,2，1,"/a/c",True
-    has_stack_level_change("/a/b/c","/a/b/d") -> 2,3，0,"/a/b",Fasle
-    has_stack_level_change("/a/b/c","/a/d") -> 1,3，-1,"/a",True
-    has_stack_level_change("/a/b/c","/a/d/e") -> 1,3,0,"/a/d",True
-    :param item: 当前任务
-    :param nextitem: 下一个任务
-    :return: tuple(共同前缀层数，item任务层数，item层数-next任务层数，共同前缀，是否发生fixture作用域变化)
-    """
-    if item is None:
-        item_collectors = []
-    else:
-        item_collectors = item.listchain()
-    if nextitem is None:
-        needed_collectors = []
-    else:
-        needed_collectors = nextitem.listchain()
-
-    item_layer = len(item_collectors)
-    diff_layer = item_layer - len(needed_collectors)
-
-    prefix = 0
-    while item_collectors[:prefix] == needed_collectors[:prefix]:
-        prefix += 1
-    prefix += -1
-
-    if item_collectors == [] or needed_collectors == []:
-        prefix_str = ""
-    else:
-        iter = item_collectors[:prefix]
-        iter = map(lambda x: x.name, iter)
-        prefix_str = reduce(lambda o, n: o + f",{n}", iter)
-
-    return prefix, item_layer, diff_layer, prefix_str, (diff_layer != 0 or prefix + 1 != item_layer)
+# def has_stack_level_change(item, nextitem):
+#     """
+#     检查两个入参的堆栈层级是否有变化
+#     例如：
+#     has_stack_level_change("/a/b","/a/c") -> 1,2，0,"/a",False
+#     has_stack_level_change("/a/b","/a/c/d") -> 1,2，1,"/a/c",True
+#     has_stack_level_change("/a/b/c","/a/b/d") -> 2,3，0,"/a/b",Fasle
+#     has_stack_level_change("/a/b/c","/a/d") -> 1,3，-1,"/a",True
+#     has_stack_level_change("/a/b/c","/a/d/e") -> 1,3,0,"/a/d",True
+#     :param item: 当前任务
+#     :param nextitem: 下一个任务
+#     :return: tuple(共同前缀层数，item任务层数，item层数-next任务层数，共同前缀，是否发生fixture作用域变化)
+#     """
+#     if item is None:
+#         item_collectors = []
+#     else:
+#         item_collectors = item.listchain()
+#     if nextitem is None:
+#         needed_collectors = []
+#     else:
+#         needed_collectors = nextitem.listchain()
+#
+#     item_layer = len(item_collectors)
+#     diff_layer = item_layer - len(needed_collectors)
+#
+#     prefix = 0
+#     while item_collectors[:prefix] == needed_collectors[:prefix]:
+#         prefix += 1
+#     prefix += -1
+#
+#     if item_collectors == [] or needed_collectors == []:
+#         prefix_str = ""
+#     else:
+#         iter = item_collectors[:prefix]
+#         iter = map(lambda x: x.name, iter)
+#         prefix_str = reduce(lambda o, n: o + f",{n}", iter)
+#
+#     return prefix, item_layer, diff_layer, prefix_str, (diff_layer != 0 or prefix + 1 != item_layer)
 
 
 class GroupRunner(object):
@@ -237,12 +226,51 @@ class GroupRunner(object):
         # 创建线程安全的os.environ
         os.environ = ThreadLocalEnviron(os.environ)
 
-        def wraps(request, fixturedef: "FixtureDef", subrequest: "SubRequest"
-                  ) -> None:
-            return self._schedule_finalizers(request, fixturedef, subrequest)
+        def _schedule_finalizers(request: FixtureRequest, fixturedef: "FixtureDef",
+                                 subrequest: "SubRequest") -> None:
+            scope = subrequest.node
+
+            with self.lock:
+                # 记录作用域和对应的fixturedef的执行结果、终结器
+                self.stack_map_fuxturedef.setdefault(scope, {})[fixturedef] = (
+                    fixturedef._finalizers, fixturedef.cached_result)
+
+            request.session._setupstate.addfinalizer(
+                functools.partial(fixturedef.finish, request=subrequest), scope
+            )
 
         # 替换添加终结器的代码，用于记录fixturedef和对应的作用域
-        FixtureRequest._schedule_finalizers = wraps
+        FixtureRequest._schedule_finalizers = _schedule_finalizers
+
+        # # FixtureRequest是一个内部类，它用于表示一个测试请求的上下文。这个类提供了对测试用例执行过程中的各种信息和状态的访问。
+        # # 当你在测试用例或fixture中使用request对象时，你实际上是在与FixtureRequest实例进行交互。
+        # # 可以认为存在一个名为request的fixture,
+        # # request对象可以：
+        # # 1. 访问测试上下文：它允许你访问当前测试的配置、参数、所属模块、类、实例等信息。
+        # # 2. 参数化支持：如果fixture被参数化，FixtureRequest对象将包含一个param属性，允许你访问当前测试用例的参数值。
+        # # 3. 添加finalizer：你可以使用addfinalizer方法为测试添加清理函数，这些函数会在测试用例执行完成后调用。
+        # # 4. 动态获取fixture：通过getfixturevalue方法，你可以动态地获取其他fixture的值。
+        # from _pytest.fixtures import FixtureRequest
+        #
+        # # _fillfixtures是一个内部方法，在执行测试函数或fixture函数过程中，这个方法会查找与参数名称相匹配的fixture，
+        # # 并将fixture的返回值注入到测试函数或其他fixture函数中。
+        # # 其内部逻辑，如果fixture没有被调用，调用_get_active_fixturedef调用并缓存执行结果
+        # # 但是在多线程运行case的场景下，会有线程同步问题(同一个fixture在不同线程中同时被执行，有不同的执行结果)
+        # # 所以要对_get_active_fixturedef限制并发调用
+        def sync_call(func):
+            """
+            装饰器，以相同的入参的调用函数时会被阻塞，使同时只能有一个并发
+            """
+            function_thread_lock_dict = defaultdict(threading.Lock)
+
+            @functools.wraps(func)
+            def run(obj, argname: str):
+                with function_thread_lock_dict[argname]:
+                    return func(obj, argname)
+
+            return run
+
+        FixtureRequest._get_active_fixturedef = sync_call(FixtureRequest._get_active_fixturedef)
 
     def pytest_collection_modifyitems(self, session, config, items: list):
         # case分组的单元的mark标签字符
@@ -258,25 +286,13 @@ class GroupRunner(object):
                 for g in groups:
                     self.item_dict.setdefault(g, []).append(item)
 
+        # 记录case和作用域的对应关系
         for item in items:
             lc = item.listchain()
             for c in lc:
                 s = self.stack_map_case.setdefault(c, set())
                 s.add(item)
         pass
-
-
-
-    def _schedule_finalizers(self, request: FixtureRequest, fixturedef: "FixtureDef",
-                             subrequest: "SubRequest") -> None:
-        scope = subrequest.node
-        # self.stack_map_fuxturedef.setdefault(scope, set()).add(fixturedef)
-        # 记录作用域和对应的fixturedef的执行结果、终结器
-        self.stack_map_fuxturedef.setdefault(scope, {})[fixturedef] = (fixturedef._finalizers, fixturedef.cached_result)
-
-        request.session._setupstate.addfinalizer(
-            functools.partial(fixturedef.finish, request=subrequest), scope
-        )
 
     def pytest_runtest_teardown(self, item: Item, nextitem: Optional[Item]) -> None:
         # return True
@@ -295,7 +311,6 @@ class GroupRunner(object):
             else:
                 item.session._setupstate.stack.pop()
 
-        # item.session._setupstate.teardown_exact(item, nextitem)
         _update_current_test_var(item, None)
 
     def init_thread_env(self, item: Function):
@@ -324,22 +339,24 @@ class GroupRunner(object):
                     setupstate.addfinalizer(finalizers.get(c), c)
             else:
                 # 对应的stack没有缓存，说明对应stack还没有执行过，直接执行即可
-                break
+                continue
 
         # 初始化fixturedef
         for c in lc:
             map = self.stack_map_fuxturedef.get(c)
             if map:
-                for fixturedef, t in map:
+                for fixturedef, t in map.items():
                     fixturedef._finalizers = t[0]
                     fixturedef.cached_result = t[1]
             else:
-                break
+                continue
+        pass
 
     @staticmethod
     def run_one_test_item(self, session, item, nextitem=None):
         try:
-            self.init_thread_env(item)
+            with self.lock:
+                self.init_thread_env(item)
 
             item.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
             if session.shouldfail:
@@ -347,35 +364,36 @@ class GroupRunner(object):
             if session.shouldstop:
                 raise session.Interrupted(session.shouldstop)
         except Exception as e:
+            logger.exception(e)
             raise e
         finally:
             with self.lock:
                 self.tasks.remove(item)
 
-    def check_all_in_group(self, performing, items):
-        """
-        检查剩余的待执行任务、执行中任务是否都在一个分组内
-
-        :param performing: 执行中的任务
-        :param items: 剩余的待执行任务
-        :return: True|False，如果剩余任务都在一个分组内，返回为True
-        """
-        performing_in_group = self.item_map_exist.setdefault(performing, [])
-        if len(performing_in_group) == 0:
-            for group_task in self.group_tasks:
-                try:
-                    _ = group_task.index(performing)
-                    performing_in_group.append(_)
-                except ValueError as e:
-                    performing_in_group.append(-1)
-
-        for item in items:
-            item_in_group = self.item_map_exist.setdefault(item, [])
-            for i in range(len(performing_in_group)):
-                if performing_in_group[i] == -1 or item_in_group[i] == -1:
-                    performing_in_group[i] = -1
-
-        return max(performing_in_group) >= 0
+    # def check_all_in_group(self, performing, items):
+    #     """
+    #     检查剩余的待执行任务、执行中任务是否都在一个分组内
+    #
+    #     :param performing: 执行中的任务
+    #     :param items: 剩余的待执行任务
+    #     :return: True|False，如果剩余任务都在一个分组内，返回为True
+    #     """
+    #     performing_in_group = self.item_map_exist.setdefault(performing, [])
+    #     if len(performing_in_group) == 0:
+    #         for group_task in self.group_tasks:
+    #             try:
+    #                 _ = group_task.index(performing)
+    #                 performing_in_group.append(_)
+    #             except ValueError as e:
+    #                 performing_in_group.append(-1)
+    #
+    #     for item in items:
+    #         item_in_group = self.item_map_exist.setdefault(item, [])
+    #         for i in range(len(performing_in_group)):
+    #             if performing_in_group[i] == -1 or item_in_group[i] == -1:
+    #                 performing_in_group[i] = -1
+    #
+    #     return max(performing_in_group) >= 0
 
     @pytest.mark.tryfirst
     def pytest_runtestloop(self, session):
@@ -395,7 +413,6 @@ class GroupRunner(object):
             self.items = items = [i for i in session.items]
             next_task = None
             for i in range(len(items)):
-
                 while True:
                     # 尝试遍历全部任务，找到一个可运行的任务
                     for item in items:
@@ -408,17 +425,9 @@ class GroupRunner(object):
 
                     # 执行任务，或短暂等待后重新搜索不冲突的任务
                     if next_task:
-                        # 要求有2个以上待执行的任务时，才能启动最前面的任务（启动任务的函数需要当前任务和下一个任务才能正确的运行fixture,否则会每个任务都运行一次fixture），
-                        # 当只剩下最后一个任务时，需要将最后一个任务加入待执行的任务的队列
-                        self.add_exec_tasks(executor, session, next_task, len(items) == 1)
+                        self.add_exec_tasks(executor, session, next_task)
                         break
                     else:
-                        # 存在一种可能，若执行中任务列表中只剩一个任务，由于pytest机制的原因，需要2个任务才能执行，所以任务队列中剩余的最后一个任务不会被执行。
-                        # 但若是剩余未放到执行中任务列表的任务全部属于一个分组，会因为分组互斥，不会被调度执行，导致任务总也不执行完
-                        # 所以需要检查剩余任务是否都在一个分组中，如果是，就只需要把剩余任务的第一个加入到执行中任务队列即可
-                        if len(self.tasks) == 1 and self.check_all_in_group(self.tasks[0], items):
-                            self.add_exec_tasks(executor, session, items[0], len(items) == 1)
-                            break
                         # 如果找不到可以运行的任务，就先稍等一下
                         time.sleep(0.1)
         return True
@@ -488,9 +497,9 @@ class GroupRunner(object):
 
             return True
 
-    def add_exec_tasks(self, executor, session, next_task, last_task=False):
+    def add_exec_tasks(self, executor, session, next_task):
         """
-        添加一个任务，并在合适的时候执行它（具体就是在有多个待执行的任务时才执行，或者在最后一个任务时批量把全部的都添加完）
+        添加一个任务，并在合适的时候执行它
         :param next_task:
         :return:
         """
@@ -500,7 +509,7 @@ class GroupRunner(object):
                 self.items.remove(next_task)
                 self.tasks.append(next_task)
             executor.submit(self.run_one_test_item, self, session, self.task_order[self.task_index],
-                            self.task_order[self.task_index + 1])
+                            None)
             self.task_index += 1
 
         def run_notconcurrent_task():
@@ -513,41 +522,14 @@ class GroupRunner(object):
             while 1 < len(self.tasks):
                 time.sleep(0.1)
 
-        def run_last_generic_task():
-            with self.lock:
-                self.tasks.append(next_task)
-            executor.submit(self.run_one_test_item, self, session, self.task_order[self.task_index], None)
-            self.task_index += 1
-
-        def run_first_generic_task():
-            with self.lock:
-                self.items.remove(next_task)
-                self.tasks.append(next_task)
-
-        # print("--------------------------------------")
-        # print(next_task)
-        # print(self.tasks)
-        # print("--------------------------------------")
-
         self.task_order.append(next_task)
-        # 当前有2个以上的任务未被执行，就先启动倒数第2个任务，倒数第一个任务可能需要稍稍等一会才能启动
-        if len(self.task_order) - self.task_index >= 2:
-            # 如果下一个待执行的任务是notconcurrent非并发任务,就等待当前任务全部执行完毕，并阻塞的等待notconcurrent任务执行完成，不调度新任务
-            if self.is_notconcurrent_task(self.task_order[self.task_index]):
-                run_notconcurrent_task()
-                return
-            else:
-                # 否则就是一个普通的任务，正常的执行就可以
-                run_generic_task()
 
-                if last_task:
-                    # 是全局的最后一个任务,就把队列中全部的任务都启动
-                    run_last_generic_task()
+        # 如果下一个待执行的任务是notconcurrent非并发任务,就等待当前任务全部执行完毕，并阻塞的等待notconcurrent任务执行完成，不调度新任务
+        if self.is_notconcurrent_task(self.task_order[self.task_index]):
+            return run_notconcurrent_task()
         else:
-            # 执行任务记录列表数小于2，说明是全局的第一个任务
-            # 是全局的第一个任务，由于不够2个任务，不足以满足启动pytest case需要的当前任务、下一个任务，就先啥都不做，等待凑齐再启动任务
-            run_first_generic_task()
-            return
+            # 否则就是一个普通的任务，正常的执行就可以
+            return run_generic_task()
 
     def _gener_item_group_key(self, item, group_unit, groups=None) -> list:
         """
