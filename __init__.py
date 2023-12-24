@@ -1,14 +1,22 @@
+import functools
 import os
 import threading
 import time
 from collections import defaultdict
 from concurrent.futures.thread import ThreadPoolExecutor
 from functools import wraps, reduce
-from typing import Tuple
+from typing import Tuple, Union, Callable, Optional
 
 import pytest
-from _pytest.fixtures import FixtureDef
-from _pytest.runner import SetupState
+from _pytest.fixtures import FixtureDef, FixtureLookupError, PseudoFixtureDef, SubRequest, scopes, FixtureRequest
+from _pytest.nodes import Item
+from _pytest.python import Function
+from _pytest.runner import SetupState, _update_current_test_var
+
+from loguru import logger
+
+logger.remove(handler_id=None)
+logger.add("dispatch-case.log")
 
 # 指定case分组的单元的mark标签字符
 CASE_GROUP_UNIT_TAG = "group-unit"
@@ -59,6 +67,17 @@ class ThreadLocalSetupState(SetupState, threading.local):
 class ThreadLocalFixtureDef(FixtureDef, threading.local):
     def __init__(self, *args, **kwargs):
         super(ThreadLocalFixtureDef, self).__init__(*args, **kwargs)
+
+
+#
+# setup_fixtrue_map = {}
+#
+# old_schedule_finalizers = _schedule_finalizers
+#
+#
+# def new_schedule_finalizers(self: FixtureRequest, finalizer: Callable[[], object], scope) -> None:
+#     map = setup_fixtrue_map.setdefault(self,{})
+#     map[]
 
 
 class ThreadLocalEnviron(os._Environ):
@@ -140,6 +159,46 @@ def parse_config(config, name):
     return None
 
 
+def has_stack_level_change(item, nextitem):
+    """
+    检查两个入参的堆栈层级是否有变化
+    例如：
+    has_stack_level_change("/a/b","/a/c") -> 1,2，0,"/a",False
+    has_stack_level_change("/a/b","/a/c/d") -> 1,2，1,"/a/c",True
+    has_stack_level_change("/a/b/c","/a/b/d") -> 2,3，0,"/a/b",Fasle
+    has_stack_level_change("/a/b/c","/a/d") -> 1,3，-1,"/a",True
+    has_stack_level_change("/a/b/c","/a/d/e") -> 1,3,0,"/a/d",True
+    :param item: 当前任务
+    :param nextitem: 下一个任务
+    :return: tuple(共同前缀层数，item任务层数，item层数-next任务层数，共同前缀，是否发生fixture作用域变化)
+    """
+    if item is None:
+        item_collectors = []
+    else:
+        item_collectors = item.listchain()
+    if nextitem is None:
+        needed_collectors = []
+    else:
+        needed_collectors = nextitem.listchain()
+
+    item_layer = len(item_collectors)
+    diff_layer = item_layer - len(needed_collectors)
+
+    prefix = 0
+    while item_collectors[:prefix] == needed_collectors[:prefix]:
+        prefix += 1
+    prefix += -1
+
+    if item_collectors == [] or needed_collectors == []:
+        prefix_str = ""
+    else:
+        iter = item_collectors[:prefix]
+        iter = map(lambda x: x.name, iter)
+        prefix_str = reduce(lambda o, n: o + f",{n}", iter)
+
+    return prefix, item_layer, diff_layer, prefix_str, (diff_layer != 0 or prefix + 1 != item_layer)
+
+
 class GroupRunner(object):
     def __init__(self, config):
         # 获取应该启动的线程数
@@ -152,6 +211,10 @@ class GroupRunner(object):
         self.task_order = []
         self.task_index = 0
         self.is_notconcurrent = {}
+        # 作用域包含的case的集合，当集合为空时，说明作用域已经完全执行完了可以卸载作用域了。
+        self.stack_map_case = {}
+        # 存储作用域对应的fuxture执行结果
+        self.stack_map_fuxturedef = {}
 
     def pytest_configure(self, config):
         # 声明@pytest.mark.group
@@ -205,9 +268,15 @@ class GroupRunner(object):
         # FixtureRequest._get_active_fixturedef = sync_call(FixtureRequest._get_active_fixturedef)
         # FixtureRequest._fillfixtures = _fillfixtures
 
-    def pytest_collection_modifyitems(self, session, config, items):
+        def wraps(request, fixturedef: "FixtureDef", subrequest: "SubRequest"
+                  ) -> None:
+            return self._schedule_finalizers(request, fixturedef, subrequest)
+
+        # 替换添加终结器的代码，用于记录fixturedef和对应的作用域
+        FixtureRequest._schedule_finalizers = wraps
+
+    def pytest_collection_modifyitems(self, session, config, items: list):
         # case分组的单元的mark标签字符
-        # CASE_UNIT_TAG
 
         for item in items:
             # 读取@pytest.mark.unit_group对case定义的分组单元
@@ -222,13 +291,405 @@ class GroupRunner(object):
 
         pass
 
-    index = 0
+        for item in items:
+            lc = item.listchain()
+            for c in lc:
+                s = self.stack_map_case.setdefault(c, set())
+                s.add(item)
+        pass
+
+        # from pytest import fail
+        # def _compute_fixture_value(self, fixturedef: "FixtureDef") -> None:
+        #     """
+        #     Creates a SubRequest based on "self" and calls the execute method of the given fixturedef object. This will
+        #     force the FixtureDef object to throw away any previous results and compute a new fixture value, which
+        #     will be stored into the FixtureDef object itself.
+        #     """
+        #     # prepare a subrequest object before calling fixture function
+        #     # (latter managed by fixturedef)
+        #     argname = fixturedef.argname
+        #     funcitem = self._pyfuncitem
+        #     scope = fixturedef.scope
+        #     try:
+        #         param = funcitem.callspec.getparam(argname)
+        #     except (AttributeError, ValueError):
+        #         from _pytest.compat import NOTSET
+        #         param = NOTSET
+        #         param_index = 0
+        #         has_params = fixturedef.params is not None
+        #         fixtures_not_supported = getattr(funcitem, "nofuncargs", False)
+        #         if has_params and fixtures_not_supported:
+        #             msg = (
+        #                 "{name} does not support fixtures, maybe unittest.TestCase subclass?\n"
+        #                 "Node id: {nodeid}\n"
+        #                 "Function type: {typename}"
+        #             ).format(
+        #                 name=funcitem.name,
+        #                 nodeid=funcitem.nodeid,
+        #                 typename=type(funcitem).__name__,
+        #             )
+        #             fail(msg, pytrace=False)
+        #         if has_params:
+        #             import inspect
+        #             import py
+        #             frame = inspect.stack()[3]
+        #             frameinfo = inspect.getframeinfo(frame[0])
+        #             source_path = py.path.local(frameinfo.filename)
+        #             source_lineno = frameinfo.lineno
+        #             rel_source_path = source_path.relto(funcitem.config.rootdir)
+        #             if rel_source_path:
+        #                 source_path_str = rel_source_path
+        #             else:
+        #                 source_path_str = str(source_path)
+        #             from _pytest.compat import getlocation
+        #             msg = (
+        #                 "The requested fixture has no parameter defined for test:\n"
+        #                 "    {}\n\n"
+        #                 "Requested fixture '{}' defined in:\n{}"
+        #                 "\n\nRequested here:\n{}:{}".format(
+        #                     funcitem.nodeid,
+        #                     fixturedef.argname,
+        #                     getlocation(fixturedef.func, funcitem.config.rootdir),
+        #                     source_path_str,
+        #                     source_lineno,
+        #                 )
+        #             )
+        #             fail(msg, pytrace=False)
+        #     else:
+        #         param_index = funcitem.callspec.indices[argname]
+        #         # if a parametrize invocation set a scope it will override
+        #         # the static scope defined with the fixture function
+        #         paramscopenum = funcitem.callspec._arg2scopenum.get(argname)
+        #         if paramscopenum is not None:
+        #             scope = scopes[paramscopenum]
+        #
+        #     subrequest = SubRequest(self, scope, param, param_index, fixturedef)
+        #
+        #     # check if a higher-level scoped fixture accesses a lower level one
+        #     subrequest._check_scope(argname, self.scope, scope)
+        #     # try:
+        #     #     # call the fixture function
+        #     #     # fixturedef.execute(request=subrequest)
+        #     # finally:
+        #     # self._schedule_finalizers(fixturedef, subrequest)
+        #     # print(f"fixturedef：{fixturedef} 依赖：{subrequest.node}")
+        #     stack_map_setup.setdefault(subrequest.node, []).append(fixturedef)
+        #
+        # def _getnextfixturedef(self, argname: str) -> "FixtureDef":
+        #     fixturedefs = self._arg2fixturedefs.get(argname, None)
+        #     if fixturedefs is None:
+        #         # we arrive here because of a dynamic call to
+        #         # getfixturevalue(argname) usage which was naturally
+        #         # not known at parsing/collection time
+        #         assert self._pyfuncitem.parent is not None
+        #         parentid = self._pyfuncitem.parent.nodeid
+        #         fixturedefs = self._fixturemanager.getfixturedefs(argname, parentid)
+        #         # TODO: Fix this type ignore. Either add assert or adjust types.
+        #         #       Can this be None here?
+        #         # self._arg2fixturedefs[argname] = fixturedefs  # type: ignore[assignment]
+        #     # fixturedefs list is immutable so we maintain a decreasing index
+        #     index = self._arg2index.get(argname, 0) - 1
+        #     if fixturedefs is None or (-index > len(fixturedefs)):
+        #         raise FixtureLookupError(argname, self)
+        #     # self._arg2index[argname] = index
+        #     return fixturedefs[index]
+        #
+        # def _get_active_fixturedef(self, argname: str
+        #                            ) -> Union["FixtureDef", PseudoFixtureDef]:
+        #     try:
+        #         return self._fixture_defs[argname]
+        #     except KeyError:
+        #         try:
+        #             fixturedef = _getnextfixturedef(self, argname)
+        #         except FixtureLookupError:
+        #             if argname == "request":
+        #                 cached_result = (self, [0], None)
+        #                 scope = "function"  # type: _Scope
+        #                 return PseudoFixtureDef(cached_result, scope)
+        #             raise
+        #     _compute_fixture_value(self, fixturedef)
+        #     return fixturedef
+        # for item in items:
+        #     request = item._request
+        #     fixturenames = getattr(item, "fixturenames", request.fixturenames)
+        #     for argname in fixturenames:
+        #         if argname not in item.funcargs:
+        #             # item.funcargs[argname] = _get_active_fixturedef(request, argname)
+        #             f = _get_active_fixturedef(request, argname)
+        #             # print(f)
+        # arr = []
+        # items = [data for data in items]
+        # # items.insert(0, None)
+        # # items.append(None)
+        # for i in range(len(items) - 1):
+        #     item = list(has_stack_level_change(items[i], items[i + 1]))
+        #     item.append(items[i])
+        #     arr.append(tuple(item))
+
+        # def _next_buttom_node(arr, index):
+        #     """
+        #     返回下一个底层节点的索引
+        #     例如arr列表的第{index}条case是模块N的第一条case，返回值就是模块N内第一个类的第一条case
+        #
+        #     :param arr:  节点缩进关系的列表
+        #     :param index:  起点位置（不包括）
+        #     :return:  下一个底层节点的索引，找不到更底层的节点，则返回None
+        #     """
+        #
+        #     bottom_layer = arr[index][0]
+        #     for i in range(index + 1, len(arr)):
+        #         if arr[i][0] > bottom_layer:
+        #             return i
+        #     return None
+        #
+        # def _next_top_node(arr, index, end):
+        #     """
+        #     返回下一个高层节点的索引
+        #     例如arr列表的第{index}条case是模块N内第一个类的第一条case，返回值就是类的最后一条case
+        #
+        #     :param arr:  节点缩进关系的列表
+        #     :param index:  起点位置
+        #     :param end:  终点点位置（包括）
+        #     :return:  下一个高层节点的索引，如果没有更高层的节点，即只有与当前节点平级的节点，返回{end}表示的记录
+        #     """
+        #     i = target = 0
+        #     bottom_layer = arr[index][0]
+        #     for i in range(index, end + 1):
+        #         if arr[i][0] >= bottom_layer:
+        #             target = i
+        #         else:
+        #             return target
+        #     return end
+        #
+        # def gener_node_group(arr, start, end, setup: list, teardown: list):
+        #
+        #     start_stack = []
+        #     end_stack = []
+        #
+        #     def set_stack(con_layer, only_layer, first, latest):
+        #         """
+        #
+        #         :param con_layer:  共同的层级
+        #         :param only_layer:  独有的层级
+        #         :param first:  行首元素
+        #         :param latest:  行尾元素
+        #         :return:
+        #         """
+        #         stack_lenth = len(start_stack)
+        #
+        #         # 清除非共同前缀的部分
+        #         if con_layer < stack_lenth:
+        #             for i in range(con_layer, stack_lenth):
+        #                 del start_stack[len(start_stack)-1]
+        #         if con_layer < len(end_stack):
+        #             for i in range(con_layer, stack_lenth):
+        #                 del end_stack[len(end_stack)-1]
+        #
+        #         stack_lenth = len(start_stack)
+        #         # 添加独有后缀部分
+        #         for i in range(stack_lenth, only_layer - 1):
+        #             start_stack.insert(i, first)
+        #             end_stack.insert(i, latest)
+        # # start_stack[arr[start][0]] = (start, arr[start])
+        # # end_stack[arr[end][0]] = (end, arr[end])
+        # layer = arr[0][0]
+        # only_layer = arr[0][1]
+        # set_stack(layer, only_layer, (0, arr[0]), (len(arr) - 1, arr[len(arr) - 1]))
+        #
+        # layer = 0
+        # for i in range(start + 1, end):
+        #     if arr[i][0] == start_stack[layer][1][0]:
+        #         setup.append((start_stack[layer][0], i))
+        #         teardown.append((i, end_stack[layer][0]))
+        #     elif arr[i][0] > start_stack[layer][1][0]:
+        #         layer = arr[i][0]
+        #         only_layer = arr[i][2]
+        #         set_stack(layer, only_layer, None, None)
+        #
+        #         setup.append((start_stack[layer][0], i))
+        #         teardown.append((i, end_stack[layer][0]))
+        #         # 对于某层只有2个元素，第2个元素会要求行尾在行尾前执行，改为行首在行尾前执行
+        #         latest = teardown[len(teardown) - 1]
+        #         if latest[0] == latest[1]:
+        #             teardown.pop()
+        #             teardown.append((start_stack[layer][0], end_stack[layer][0]))
+        #
+        #         # 更新双端
+        #         layer = arr[i][0]
+        #         only_layer = arr[i][2]
+        #         top = _next_top_node(arr, i, end)
+        #         set_stack(layer, only_layer, (i, arr[i]), (top, arr[top]))
+        #
+        #     elif arr[i][0] < start_stack[len(start_stack) - 1][1][0]:
+        #         layer = arr[i][0]
+        #         only_layer = arr[i][1]
+        #         top = _next_top_node(arr, i, end)
+        #         set_stack(layer, only_layer,  (i, arr[i]), (top, arr[top]))
+        #
+        #         setup.append((start_stack[layer][0], i))
+        #         teardown.append((i, end_stack[layer][0]))
+        # next_end = _next_top_node(arr, i, end)
+        # if next_end == i:
+        #     continue
+        # elif next_end < end:
+        #     gener_node_group(arr, i, next_end, setup, teardown)
+        #     gener_node_group(arr, next_end + 1, end, setup, teardown)
+        # elif next_end >= end:
+        #     gener_node_group(arr, i, next_end, setup, teardown)
+        # while True:
+        #     sub_start = _next_buttom_node(arr, start)
+        #     if sub_start is not None:
+        #         for i in range(start + 1, sub_start + 1):
+        #             setup.append((start, i))
+        #         gener_node_group(arr, sub_start, end, setup, teardown)
+        #     else:
+        #         next_end = _next_top_node(arr, start, end)
+        #         if next_end - start > 2:
+        #             for i in range(start + 1, next_end - 1):
+        #                 teardown.append((i, next_end))
+        #             gener_node_group(arr, sub_start, end, setup, teardown)
+        # next_end = start
+        # while True:
+        #     next_end = _next_top_node(arr, next_end, end)
+        #     if next_end < end:
+        #         groups.append((start, next_end))
+        #         next_end += 1
+        #     else:
+        #         break
+        #
+        # while True:
+        #     # 搜索子组的起点
+        #     groups.append((start, next_end))
+        #
+        #     if sub_start is not None:
+        #         groups.append((start, sub_start))
+        # groups = []
+        # setup = []
+        # teardown = []
+        # gener_node_group(arr, 0, len(arr) - 1, setup, teardown)
+        # pass
+        # def gener_node_group(arr, start, end, groups: list):
+        #     # 记录当前组本身
+        #     next_end = _next_top_node(arr, start, end)
+        #
+        #     # 记录可能存在的子组
+        #     while True:
+        #         # 搜索子组的起点
+        #         sub_start = _next_buttom_node(arr, start)
+        #         if sub_start is not None:
+        #             # 搜索子组的终点
+        #             tmp = _next_top_node(arr, sub_start, end)
+        #             if next_end <= tmp:
+        #                 # 子组的终点就是当前组的终点，说明当前组已经处理完毕，退出搜索
+        #                 # 记录搜索到的子组
+        #                 groups.append((start, sub_start, next_end))
+        #                 # 子组内可以还有子组，把子组、子组的子组记录
+        #                 gener_node_group(arr, sub_start, next_end, groups)
+        #                 # return
+        #             # else:
+        #             # 子组之后还可以有其他子组，移动limit,使其搜索当前子组之后的子组
+        #             start = tmp + 1
+        #             gener_node_group(arr, sub_start, next_end, groups)
+        #         else:
+        #             # 没有子组
+        #             next_start = start
+        #
+        #             # 处理前面是底层，后面都是高层
+        #             up = [next_start, next_end]
+        #             _ = next_end
+        #             while True:
+        #                 _ = _next_top_node(arr, _ + 1, end)
+        #                 if _ <= end:
+        #                     up.append(_)
+        #
+        #                 if _ >= end:
+        #                     break
+        #             groups.append(up)
+        #
+        #             if next_end < end:
+        #                 gener_node_group(arr, next_end + 1, end, groups)
+        #
+        #             return
+        #
+        # groups = []
+        # gener_node_group(arr, 0, len(arr) - 1, groups)
+        # pass
+
+    def _schedule_finalizers(self, request: FixtureRequest, fixturedef: "FixtureDef",
+                             subrequest: "SubRequest") -> None:
+        scope = subrequest.node
+        # self.stack_map_fuxturedef.setdefault(scope, set()).add(fixturedef)
+        # 记录作用域和对应的fixturedef的执行结果、终结器
+        self.stack_map_fuxturedef.setdefault(scope, {})[fixturedef] = (fixturedef._finalizers, fixturedef.cached_result)
+
+        request.session._setupstate.addfinalizer(
+            functools.partial(fixturedef.finish, request=subrequest), scope
+        )
+
+    def pytest_runtest_teardown(self, item: Item, nextitem: Optional[Item]) -> None:
+        # return True
+        _update_current_test_var(item, "teardown")
+
+        # 根据case的stack,更新作用域下未执行的case的记录，如果作用域下无待执行的case,说明作用域已完成，执行卸载操作
+        lc = item.listchain()
+        lc.reverse()
+        for c in lc:
+            s: set = self.stack_map_case.get(c)
+            s.remove(item)
+            logger.info(f"case: {item} 已完成，作用域： {c.nodeid} 下剩余任务数量为：{len(s)}")
+            if len(s) == 0:
+                logger.info(f"case: {item} 已完成，作用域： {c.nodeid} 作用域正在被卸载")
+                item.session._setupstate._pop_and_teardown()
+            else:
+                item.session._setupstate.stack.pop()
+
+        # item.session._setupstate.teardown_exact(item, nextitem)
+        _update_current_test_var(item, None)
+
+    def init_thread_env(self, item: Function):
+        """
+        初始化线程相关的case运行上下文，包括session._setupstate.stack、fixturedef
+        :param item: 要运行的case
+        :return:
+        """
+        # 获取倒序的stack
+        lc = item.listchain()
+        lc.reverse()
+
+        # 存储作用域对应的stack
+        self.stack_map_content = {}
+
+        # 初始化session._setupstate.stack
+        setupstate: SetupState = item.session._setupstate
+        setupstate.stack = []
+        setupstate._finalizers = {}
+        for c in lc:
+            stack_finalizers_tuple = self.stack_map_content.get(c)
+            if stack_finalizers_tuple:
+                setupstate.stack.append(c)
+                finalizers = stack_finalizers_tuple[1]
+                if finalizers.get(c):
+                    setupstate.addfinalizer(finalizers.get(c), c)
+            else:
+                # 对应的stack没有缓存，说明对应stack还没有执行过，直接执行即可
+                break
+
+        # 初始化fixturedef
+        for c in lc:
+            map = self.stack_map_fuxturedef.get(c)
+            if map:
+                for fixturedef, t in map:
+                    fixturedef._finalizers = t[0]
+                    fixturedef.cached_result = t[1]
+            else:
+                break
 
     @staticmethod
     def run_one_test_item(self, session, item, nextitem=None):
         try:
-            reports = item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
-            # item.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
+            self.init_thread_env(item)
+            # reports = item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+            item.config.hook.pytest_runtest_protocol(item=item, nextitem=None)
             if session.shouldfail:
                 raise session.Failed(session.shouldfail)
             if session.shouldstop:
